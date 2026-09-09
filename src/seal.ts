@@ -1,17 +1,45 @@
-import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
-import { getPublicKey } from 'nostr-tools/pure'
-import { unwrapEvent, wrapEvent } from 'nostr-tools/nip59'
+import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from '@noble/hashes/utils.js'
+import { sha256 } from '@noble/hashes/sha2.js'
+import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
+import { wrapEvent } from 'nostr-tools/nip59'
+import { decrypt as nip44Decrypt, getConversationKey } from 'nostr-tools/nip44'
 import type { NostrEvent } from 'nostr-tools/pure'
 import { splitCK, reconstructCK } from 'dominion-protocol'
 import { buildVaultShareEvent, parseVaultShare } from 'dominion-protocol/nostr'
 
 /** The tier name a sealed epoch's shares carry in their dominion vault-share event. */
 export const SEALED_TIER = 'sealed'
+/** Shortest time lock a seal may commit to. */
+export const MIN_DELAY_SECONDS = 3600
+
+const HEX64 = /^[0-9a-f]{64}$/
+const KIND_SEAL = 13
+
+/**
+ * The circle in one canonical order: deduplicated, sorted, lower-case hex.
+ * Every hash over the circle, and every ring an election commits to, uses
+ * this order, so two members never disagree about who the circle is.
+ */
+export function canonicalCircle(members: readonly string[]): string[] {
+  const set = [...new Set(members)]
+  if (set.some((m) => typeof m !== 'string' || !HEX64.test(m))) throw new Error('members must be lower-case 64-hex pubkeys')
+  return set.sort()
+}
+
+/** sha256 of the canonical circle joined by commas: the same bytes nostr-anon-vote commits to as its ring hash. */
+export function circleHash(members: readonly string[]): string {
+  return bytesToHex(sha256(utf8ToBytes(canonicalCircle(members).join(','))))
+}
+
+/** Commitment to one share: sha256(index || data). Reveals nothing, since a share is 32 uniformly random bytes. */
+export function shareCommitment(index: number, data: Uint8Array): string {
+  return bytesToHex(sha256(new Uint8Array([index & 0xff, ...data])))
+}
 
 export interface SealOptions {
   /** The 32-byte key the closed epoch's store is encrypted under. */
   epochKey: Uint8Array
-  /** The epoch's id, as the store names it. */
+  /** The epoch's id, as the store names it. No colon: the vault-share d tag is `epoch:tier`. */
   epochId: string
   /** The keeper's private key: the author of the shares and the only key that can ask for them back. */
   keeperPrivateKey: Uint8Array
@@ -19,6 +47,8 @@ export interface SealOptions {
   members: string[]
   /** How many members must hand back a share. */
   threshold: number
+  /** The shortest time lock a recovery of this epoch may carry, in seconds. Members measure it from their own first sight of the request. */
+  delaySeconds: number
   now?: () => number
 }
 
@@ -30,64 +60,163 @@ export interface SealedShare {
   wrap: NostrEvent
 }
 
+export interface Sealing {
+  /** Random id of this sealing; every share carries it and shares from different sealings never mix. */
+  sealId: string
+  /** Hash of the canonical circle the epoch was sealed to. */
+  circle: string
+  /** The committed delay. */
+  delaySeconds: number
+  /** Commitment per share index, in index order. The keeper may keep these; they reveal nothing. */
+  commitments: string[]
+  shares: SealedShare[]
+}
+
 /**
  * Split an epoch key across the circle and wrap one share to each member.
  *
  * Each share is a dominion kind 30480 vault-share rumor (tier `sealed`,
- * content the 32-byte share, index in a `share` tag), sealed by the keeper
- * and gift-wrapped to the member, so a relay sees only a wrap to a key.
- * The keeper then destroys the epoch key locally; that destruction is what
- * makes compulsion yield the current epoch and nothing older.
+ * content the 32-byte share) carrying the share index, the threshold, the
+ * sealing id, the circle hash, the committed delay and a commitment to every
+ * share of the sealing. It is sealed by the keeper and gift-wrapped to the
+ * member, so a relay sees only a wrap to a key. The keeper then destroys the
+ * epoch key locally; that destruction is what makes compulsion yield the
+ * current epoch and nothing older.
  */
-export function sealEpoch(opts: SealOptions): SealedShare[] {
-  const members = [...new Set(opts.members)]
+export function sealEpoch(opts: SealOptions): Sealing {
+  const members = canonicalCircle(opts.members)
   if (members.length < 2) throw new Error('a circle needs at least two members')
-  if (opts.threshold < 2 || opts.threshold > members.length) throw new Error('threshold must be between 2 and the number of members')
-  if (opts.epochKey.length !== 32) throw new Error('epoch key must be 32 bytes')
+  if (!Number.isInteger(opts.threshold) || opts.threshold < 2 || opts.threshold > members.length) throw new Error('threshold must be between 2 and the number of members')
+  if (!(opts.epochKey instanceof Uint8Array) || opts.epochKey.length !== 32) throw new Error('epoch key must be 32 bytes')
+  if (typeof opts.epochId !== 'string' || !opts.epochId || opts.epochId.includes(':')) throw new Error('epoch id must be a non-empty string without a colon')
+  if (!Number.isInteger(opts.delaySeconds) || opts.delaySeconds < MIN_DELAY_SECONDS) throw new Error(`delay must be at least ${MIN_DELAY_SECONDS} seconds`)
   const keeperPub = getPublicKey(opts.keeperPrivateKey)
-  const shares = splitCK(opts.epochKey, opts.threshold, members.length)
-  return shares.map((share, i) => {
+  if (members.includes(keeperPub)) throw new Error('the keeper is not a member of its own circle')
+  const sealId = bytesToHex(randomBytes(16))
+  const circle = circleHash(members)
+  const raw = splitCK(opts.epochKey, opts.threshold, members.length)
+  const byIndex = [...raw].sort((a, b) => a.index - b.index)
+  const commitments = byIndex.map((s) => shareCommitment(s.index, s.data))
+  const shares = byIndex.map((share, i) => {
     const member = members[i]!
     const rumor = buildVaultShareEvent(keeperPub, member, bytesToHex(share.data), opts.epochId, SEALED_TIER)
-    rumor.tags.push(['share', String(share.index)], ['threshold', String(opts.threshold)])
+    rumor.tags.push(
+      ['share', String(share.index)],
+      ['threshold', String(opts.threshold)],
+      ['seal', sealId],
+      ['circle', circle],
+      ['delay', String(opts.delaySeconds)],
+      ...commitments.map((c, j) => ['commit', String(byIndex[j]!.index), c]),
+    )
     if (opts.now) rumor.created_at = opts.now()
     return { member, index: share.index, wrap: wrapEvent(rumor, opts.keeperPrivateKey, member) }
   })
+  return { sealId, circle, delaySeconds: opts.delaySeconds, commitments, shares }
 }
 
 export interface OpenedShare {
-  /** The keeper who sealed it. */
+  /** Who authored the rumor: the keeper on a fresh share, the member on a returned one. */
   keeper: string
   epochId: string
   index: number
   threshold: number
+  sealId: string
+  circle: string
+  delaySeconds: number
+  /** Commitment per index for the whole sealing, keyed by index. */
+  commitments: Map<number, string>
   data: Uint8Array
 }
 
-/** A member opens the wrap addressed to them and gets their share, verified as the keeper's. */
-export function openShare(wrap: NostrEvent, memberPrivateKey: Uint8Array): OpenedShare {
-  const rumor = unwrapEvent(wrap, memberPrivateKey)
-  const parsed = parseVaultShare(rumor as unknown as Record<string, unknown>)
-  if (!parsed || parsed.tier !== SEALED_TIER) throw new Error('not a sealed share')
-  const index = Number(rumor.tags.find((t) => t[0] === 'share')?.[1])
-  const threshold = Number(rumor.tags.find((t) => t[0] === 'threshold')?.[1])
-  if (!Number.isInteger(index) || index < 1 || !Number.isInteger(threshold) || threshold < 2) throw new Error('malformed sealed share')
-  const to = rumor.tags.find((t) => t[0] === 'p')?.[1]
-  if (to !== getPublicKey(memberPrivateKey)) throw new Error('this share was not sealed to this member')
-  return { keeper: parsed.fromPubkey, epochId: parsed.epochId, index, threshold, data: hexToBytes(parsed.ckHex) }
+function tagValue(tags: string[][], name: string): string | undefined {
+  const ts = tags.filter((t) => t[0] === name)
+  return ts.length === 1 ? ts[0]![1] : undefined
 }
 
 /**
- * Reconstruct the epoch key from exactly `threshold` distinct shares for one
- * epoch. Shares that come back through `releaseShare` are authored by the
- * member who held them, so authorship is not compared here; the keeper
- * recovering knows whose shares they asked for, and a wrong share simply
- * yields the wrong key, which the store's own authentication rejects.
+ * Open a gift wrap by hand. nostr-tools' unwrapEvent verifies nothing: it
+ * decrypts twice and hands back whatever is inside. Here the seal must be a
+ * validly signed kind 13 and the rumor's author must be the seal's signer,
+ * otherwise anyone who can encrypt to the member could hand them a "share"
+ * in the keeper's name.
  */
-export function recoverEpoch(shares: OpenedShare[]): Uint8Array {
-  if (shares.length === 0) throw new Error('no shares')
-  const { epochId, threshold } = shares[0]!
-  if (shares.some((s) => s.epochId !== epochId || s.threshold !== threshold)) throw new Error('shares are not from one sealing')
+function unwrapVerified(wrap: NostrEvent, memberPrivateKey: Uint8Array): { rumor: Record<string, unknown>; sealer: string } {
+  if (!wrap || typeof wrap !== 'object' || typeof wrap.content !== 'string' || !HEX64.test(wrap.pubkey ?? '')) throw new Error('not a gift wrap')
+  const seal = JSON.parse(nip44Decrypt(wrap.content, getConversationKey(memberPrivateKey, wrap.pubkey))) as NostrEvent
+  if (!seal || typeof seal !== 'object' || seal.kind !== KIND_SEAL || typeof seal.content !== 'string') throw new Error('not a seal')
+  if (!Array.isArray(seal.tags) || seal.tags.length !== 0) throw new Error('a seal carries no tags')
+  const bare = { kind: seal.kind, pubkey: seal.pubkey, created_at: seal.created_at, tags: seal.tags, content: seal.content, id: seal.id, sig: seal.sig }
+  if (!verifyEvent(bare)) throw new Error('seal signature does not verify')
+  const rumor = JSON.parse(nip44Decrypt(seal.content, getConversationKey(memberPrivateKey, seal.pubkey))) as Record<string, unknown>
+  if (!rumor || typeof rumor !== 'object' || rumor.pubkey !== seal.pubkey) throw new Error('rumor author is not the sealer')
+  return { rumor, sealer: seal.pubkey }
+}
+
+/** A member opens the wrap addressed to them and gets their share, verified as the sealer's. */
+export function openShare(wrap: NostrEvent, memberPrivateKey: Uint8Array): OpenedShare {
+  const { rumor, sealer } = unwrapVerified(wrap, memberPrivateKey)
+  const parsed = parseVaultShare(rumor)
+  if (!parsed || parsed.tier !== SEALED_TIER || parsed.fromPubkey !== sealer) throw new Error('not a sealed share')
+  const tags = rumor.tags as string[][]
+  const index = Number(tagValue(tags, 'share'))
+  const threshold = Number(tagValue(tags, 'threshold'))
+  const sealId = tagValue(tags, 'seal')
+  const circle = tagValue(tags, 'circle')
+  const delaySeconds = Number(tagValue(tags, 'delay'))
+  if (!Number.isInteger(index) || index < 1 || index > 255) throw new Error('malformed sealed share')
+  if (!Number.isInteger(threshold) || threshold < 2) throw new Error('malformed sealed share')
+  if (!sealId || !/^[0-9a-f]{32}$/.test(sealId) || !circle || !HEX64.test(circle)) throw new Error('malformed sealed share')
+  if (!Number.isInteger(delaySeconds) || delaySeconds < MIN_DELAY_SECONDS) throw new Error('malformed sealed share')
+  if (parsed.epochId.includes(':') || tagValue(tags, 'd') !== `${parsed.epochId}:${SEALED_TIER}`) throw new Error('malformed sealed share')
+  const commitments = new Map<number, string>()
+  for (const t of tags) {
+    if (t[0] !== 'commit') continue
+    const i = Number(t[1])
+    if (!Number.isInteger(i) || i < 1 || i > 255 || !HEX64.test(t[2] ?? '') || commitments.has(i)) throw new Error('malformed sealed share')
+    commitments.set(i, t[2]!)
+  }
+  if (commitments.size < threshold || !commitments.has(index)) throw new Error('malformed sealed share')
+  const to = tagValue(tags, 'p')
+  if (to !== getPublicKey(memberPrivateKey)) throw new Error('this share was not sealed to this member')
+  const data = hexToBytes(parsed.ckHex)
+  if (shareCommitment(index, data) !== commitments.get(index)) throw new Error('share does not match its commitment')
+  return { keeper: sealer, epochId: parsed.epochId, index, threshold, sealId, circle, delaySeconds, commitments, data }
+}
+
+export interface RecoverOptions {
+  /** What the keeper recorded at sealing time, if kept. Returned shares are then checked against it, not only against each other. */
+  expected?: { sealId: string; commitments: string[] }
+}
+
+/** Thrown by recoverEpoch when a share fails its commitment. `index` names the share, and so the member. */
+export class PoisonedShareError extends Error {
+  constructor(public readonly index: number, message: string) {
+    super(message)
+    this.name = 'PoisonedShareError'
+  }
+}
+
+/**
+ * Reconstruct the epoch key from `threshold` distinct shares of one sealing.
+ * Every share must carry the same sealing id and the same commitment set,
+ * and hash to its own commitment; a share that does not is reported by
+ * index, which the recovering keeper can map to the member who returned it.
+ */
+export function recoverEpoch(shares: OpenedShare[], opts: RecoverOptions = {}): Uint8Array {
+  if (!Array.isArray(shares) || shares.length === 0) throw new Error('no shares')
+  const first = shares[0]!
+  const { epochId, threshold, sealId } = first
+  const reference = opts.expected
+    ? new Map(opts.expected.commitments.map((c, i) => [i + 1, c]))
+    : first.commitments
+  if (opts.expected && opts.expected.sealId !== sealId) throw new Error('shares are not from the expected sealing')
+  for (const s of shares) {
+    if (s.epochId !== epochId || s.threshold !== threshold || s.sealId !== sealId) throw new Error('shares are not from one sealing')
+    if (s.commitments.size !== reference.size || [...reference].some(([i, c]) => s.commitments.get(i) !== c)) {
+      throw new PoisonedShareError(s.index, `share ${s.index} carries a different commitment set`)
+    }
+    if (shareCommitment(s.index, s.data) !== reference.get(s.index)) throw new PoisonedShareError(s.index, `share ${s.index} does not match its commitment`)
+  }
   const distinct = new Map(shares.map((s) => [s.index, s]))
   if (distinct.size < threshold) throw new Error(`need ${threshold} distinct shares, have ${distinct.size}`)
   const chosen = [...distinct.values()].slice(0, threshold)
