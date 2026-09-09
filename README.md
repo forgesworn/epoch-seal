@@ -1,5 +1,10 @@
 # epoch-seal
 
+[![CI](https://github.com/forgesworn/epoch-seal/actions/workflows/ci.yml/badge.svg)](https://github.com/forgesworn/epoch-seal/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/epoch-seal)](https://www.npmjs.com/package/epoch-seal)
+[![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](./LICENCE)
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/TheCryptoDonkey?logo=githubsponsors&color=ea4aaa&label=Sponsor)](https://github.com/sponsors/TheCryptoDonkey)
+
 **An old week needs three of your friends, a delay, and nobody saying no.**
 
 A box encrypts its store per epoch. When an epoch closes, this library

@@ -37,6 +37,14 @@
     "type": "git",
     "url": "https://github.com/forgesworn/epoch-seal"
   },
+  "homepage": "https://github.com/forgesworn/epoch-seal#readme",
+  "bugs": {
+    "url": "https://github.com/forgesworn/epoch-seal/issues"
+  },
+  "funding": {
+    "type": "lightning",
+    "url": "lightning:profusemeat89@walletofsatoshi.com"
+  },
   "engines": {
     "node": ">=22"
   },
