@@ -67,6 +67,15 @@ const key = recoverEpoch(returnedShares.map((w) => openShare(w, myCurrentKey)), 
 - `recoverEpoch` needs `threshold` distinct shares from one sealing that all carry the same commitment set and each match their commitment. Shares from two sealings never mix.
 - The keeper may not be a member of its own circle, and the epoch id may not contain a colon.
 
+## What remains
+
+In the profile's own words, from its table of what can be compelled: a
+compelled person yields the current epoch, and no more. A box can be
+seized; sealed parcels are bytes without the circle's keys; the keeper's
+own tier is the keeper's. And the circle is the defence: a keeper whose
+friends will release under pressure has no protection this library can
+add.
+
 ## Licence
 
 MIT. ForgeSworn.
