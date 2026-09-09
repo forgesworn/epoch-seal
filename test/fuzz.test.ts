@@ -55,7 +55,7 @@ describe('fuzz: recovery', () => {
     for (let i = 0; i < 200; i++) {
       const junk = finalizeEvent({ kind: r() < 0.5 ? 30482 : Math.floor(r() * 40000), created_at: Math.floor(Date.now() / 1000), tags: [['d', 'unseal:e2:1'], ['title', 'x'], ['closes', String(Math.floor(r() * 2e9))]], content: 'garbage' }, generateSecretKey())
       expect(() => requestDetails(junk)).toThrow()
-      expect(() => releaseShare({ memberPrivateKey: circle[members.indexOf(sealed[0]!.member)]!, share, request: junk, ballots: [], members, firstSeen: 1, now: later })).toThrow()
+      expect(() => releaseShare({ memberPrivateKey: circle[members.indexOf(sealed[0]!.member)]!, share, request: junk, ballots: [], firstSeen: 1, now: later })).toThrow()
     }
     const request = await requestRecovery({ keeperPrivateKey: keeper, epochId: 'e2', members, delaySeconds: 3600, recoverTo: getPublicKey(generateSecretKey()), now: () => later - 3601 })
     for (let i = 0; i < 200; i++) {

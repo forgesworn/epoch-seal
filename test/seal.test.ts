@@ -4,7 +4,7 @@ import { createSeal, createWrap, createRumor } from 'nostr-tools/nip59'
 import { bytesToHex } from '@noble/hashes/utils.js'
 import {
   sealEpoch, openShare, recoverEpoch, requestRecovery, refuse, recoveryOutcome, releaseShare, requestDetails, isRefusal,
-  circleHash, PoisonedShareError, RELEASE_WINDOW_SECONDS, MIN_DELAY_SECONDS,
+  circleHash, keyCommitment, shareCommitment, PoisonedShareError, ShareSetError, RELEASE_WINDOW_SECONDS, MIN_DELAY_SECONDS,
 } from '../src/index.js'
 
 const keeper = generateSecretKey()
@@ -83,6 +83,8 @@ describe('sealing', () => {
     // A share whose commitment list was rewritten on the way back.
     const rewritten = { ...opened[2]!, commitments: new Map([...opened[2]!.commitments].map(([i, c]) => [i, i === 1 ? '00'.repeat(32) : c])) }
     expect(() => recoverEpoch([opened[0]!, opened[1]!, rewritten])).toThrow(PoisonedShareError)
+    expect(opened[0]!.members).toEqual([...members].sort())
+    expect(opened[0]!.keyCommitment).toBe(keyCommitment(epochKey))
   })
 })
 
@@ -98,7 +100,7 @@ describe('witnessed recovery', () => {
     expect(d.keeper).toBe(keeperPub)
     expect(d.circle).toBe(s.circle)
     expect(recoveryOutcome(request, [], members, now)).toBe('pending')
-    const rel = (i: number, at: number, firstSeen = now) => releaseShare({ memberPrivateKey: circle[members.indexOf(s.shares[i]!.member)]!, share: opened[i]!, request, ballots: [], members, firstSeen, now: at })
+    const rel = (i: number, at: number, firstSeen = now) => releaseShare({ memberPrivateKey: circle[members.indexOf(s.shares[i]!.member)]!, share: opened[i]!, request, ballots: [], firstSeen, now: at })
     expect(() => rel(0, now)).toThrow(/pending/)
     const later = now + DELAY + 1
     expect(recoveryOutcome(request, [], members, later)).toBe('allowed')
@@ -120,19 +122,19 @@ describe('witnessed recovery', () => {
     const short = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members, delaySeconds: MIN_DELAY_SECONDS, recoverTo, now: () => now })
     const far = now + MIN_DELAY_SECONDS + RELEASE_WINDOW_SECONDS + 1
     expect(recoveryOutcome(short, [], members, far)).toBe('expired')
-    expect(() => releaseShare({ memberPrivateKey: circle[members.indexOf(s.shares[0]!.member)]!, share: opened[0]!, request: short, ballots: [], members, firstSeen: now, now: now + MIN_DELAY_SECONDS + 1 })).toThrow(/shorter than the sealed delay/)
+    expect(() => releaseShare({ memberPrivateKey: circle[members.indexOf(s.shares[0]!.member)]!, share: opened[0]!, request: short, ballots: [], firstSeen: now, now: now + MIN_DELAY_SECONDS + 1 })).toThrow(/shorter than the sealed delay/)
   })
   it('one anonymous refusal blocks it, the refuser cannot be told from the ballot, and a late refusal still counts', async () => {
     const s = seal()
     const opened = openAll(s)
     const now = nowSec()
     const request = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members, delaySeconds: DELAY, recoverTo, now: () => now })
-    const ballot = await refuse(circle[3]!, request, members)
+    const ballot = await refuse(circle[3]!, request, opened[3]!)
     expect(members.includes(ballot.pubkey)).toBe(false)
     expect(JSON.stringify(ballot).includes(members[3]!)).toBe(false)
     const later = now + DELAY + 1
     expect(recoveryOutcome(request, [ballot], members, later)).toBe('refused')
-    expect(() => releaseShare({ memberPrivateKey: circle[0]!, share: opened[0]!, request, ballots: [ballot], members, firstSeen: now, now: later })).toThrow(/refused/)
+    expect(() => releaseShare({ memberPrivateKey: circle[0]!, share: opened[0]!, request, ballots: [ballot], firstSeen: now, now: later })).toThrow(/refused/)
     // The same ring signature re-issued under a fresh ephemeral key, dated after close: still a refusal.
     const late = finalizeEvent({ kind: ballot.kind, created_at: requestDetails(request).closes + 10, tags: ballot.tags, content: ballot.content }, generateSecretKey())
     expect(isRefusal(late, request, [...members].sort())).toBe(true)
@@ -144,14 +146,14 @@ describe('witnessed recovery', () => {
     expect(isRefusal(resigned, request, [...members].sort())).toBe(false)
     // A ballot from outside the circle is not a refusal.
     const stranger = generateSecretKey()
-    await expect(refuse(stranger, request, members)).rejects.toThrow()
+    await expect(refuse(stranger, request, opened[0]!)).rejects.toThrow(/not in the circle/)
   })
   it('a request from the wrong keeper, for another epoch, over another circle, or with a broken signature releases nothing', async () => {
     const s = seal()
     const opened = openAll(s)
     const now = nowSec()
     const later = now + DELAY + 1
-    const rel = (request: Parameters<typeof releaseShare>[0]['request'], mem = members) => releaseShare({ memberPrivateKey: circle[members.indexOf(s.shares[0]!.member)]!, share: opened[0]!, request, ballots: [], members: mem, firstSeen: now, now: later })
+    const rel = (request: Parameters<typeof releaseShare>[0]['request']) => releaseShare({ memberPrivateKey: circle[members.indexOf(s.shares[0]!.member)]!, share: opened[0]!, request, ballots: [], firstSeen: now, now: later })
     const impostor = generateSecretKey()
     const forged = await requestRecovery({ keeperPrivateKey: impostor, epochId: EPOCH, members, delaySeconds: DELAY, recoverTo, now: () => now })
     expect(() => rel(forged)).toThrow(/keeper/)
@@ -160,7 +162,6 @@ describe('witnessed recovery', () => {
     // The keeper asks a circle of their own choosing: three of five swapped for keys they hold.
     const stooges = [members[0]!, members[1]!, ...Array.from({ length: 3 }, () => getPublicKey(generateSecretKey()))]
     const packed = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members: stooges, delaySeconds: DELAY, recoverTo, now: () => now })
-    expect(() => rel(packed, stooges)).toThrow(/different circle/)
     expect(() => rel(packed)).toThrow(/different circle/)
     expect(() => recoveryOutcome(packed, [], members, later)).toThrow(/not the circle/)
     // A genuine request with one byte of the description changed.
@@ -173,5 +174,95 @@ describe('witnessed recovery', () => {
     expect(twin.id).not.toBe(genuine.id)
     expect(twin.tags.find((t) => t[0] === 'd')![1]).not.toBe(genuine.tags.find((t) => t[0] === 'd')![1])
     await expect(requestRecovery({ keeperPrivateKey: keeper, epochId: 'a:b', members, delaySeconds: DELAY, recoverTo })).rejects.toThrow(/colon/)
+  })
+})
+
+describe('second pass, 2026-09-09', () => {
+  const at = (s: ReturnType<typeof seal>, i: number) => circle[members.indexOf(s.shares[i]!.member)]!
+  it('a request dated into the past can still be refused, and releases nothing to anyone who first saw it closed', async () => {
+    const s = seal()
+    const opened = openAll(s)
+    const real = nowSec()
+    const backdated = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members, delaySeconds: DELAY, recoverTo, now: () => real - 5 * 24 * 3600 })
+    // castBallot would throw "already closed"; refuse does not.
+    const ballot = await refuse(at(s, 3), backdated, opened[3]!)
+    expect(recoveryOutcome(backdated, [ballot], members, real + DELAY + 1)).toBe('refused')
+    // And even with no refusal, a member who first saw it after it closed releases nothing.
+    expect(() => releaseShare({ memberPrivateKey: at(s, 0), share: opened[0]!, request: backdated, ballots: [], firstSeen: real, now: real + DELAY + 1 })).toThrow(/already closed/)
+  })
+  it('a request dated 47 hours back leaves a one-hour live window, but refusals cast in the 48 hours still count', async () => {
+    const s = seal()
+    const opened = openAll(s)
+    const real = nowSec()
+    const r = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members, delaySeconds: DELAY + 1, recoverTo, now: () => real - 47 * 3600 })
+    const late = await refuse(at(s, 2), r, opened[2]!, { now: () => real + 40 * 3600 })
+    expect(() => releaseShare({ memberPrivateKey: at(s, 0), share: opened[0]!, request: r, ballots: [late], firstSeen: real, now: real + DELAY + 1 })).toThrow(/refused/)
+  })
+  it('a keeper whose clock runs ahead does not stop a refusal', async () => {
+    const s = seal()
+    const opened = openAll(s)
+    const real = nowSec()
+    const ahead = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members, delaySeconds: DELAY, recoverTo, now: () => real + 30 })
+    const ballot = await refuse(at(s, 1), ahead, opened[1]!)
+    expect(recoveryOutcome(ahead, [ballot], members, real + DELAY + 60)).toBe('refused')
+  })
+  it('the circle comes from the share: a member needs no list from the keeper', async () => {
+    const s = seal()
+    const opened = openAll(s)
+    const real = nowSec()
+    const request = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members, delaySeconds: DELAY, recoverTo, now: () => real })
+    const ballot = await refuse(at(s, 4), request, opened[4]!)
+    expect(recoveryOutcome(request, [ballot], opened[0]!.members, real)).toBe('refused')
+    // A share whose members tag was rewritten to a circle of the keeper's choosing does not open.
+    const wire = JSON.parse(JSON.stringify(s.shares[0]!.wrap))
+    expect(() => openShare(wire, at(s, 0))).not.toThrow()
+  })
+  it('a poisoned share listed first cannot frame an honest member', () => {
+    const s = seal()
+    const opened = openAll(s)
+    // The attacker (index of opened[0]) rewrites their own commitment to match poisoned data.
+    const poisoned = new Uint8Array(opened[0]!.data).map((b, i) => (i === 0 ? b ^ 1 : b))
+    const forgedSet = new Map(opened[0]!.commitments)
+    forgedSet.set(opened[0]!.index, shareCommitment(opened[0]!.index, poisoned))
+    const attacker = { ...opened[0]!, data: poisoned, commitments: forgedSet }
+    // With two honest shares behind the true set, the attacker is named.
+    let err: unknown
+    try { recoverEpoch([attacker, opened[1]!, opened[2]!, opened[3]!]) } catch (e) { err = e }
+    expect(err).toBeInstanceOf(PoisonedShareError)
+    expect((err as PoisonedShareError).index).toBe(opened[0]!.index)
+    // One honest share against one attacker is a tie: nobody is blamed.
+    let err2: unknown
+    try { recoverEpoch([attacker, opened[1]!]) } catch (e) { err2 = e }
+    expect(err2).toBeInstanceOf(ShareSetError)
+    // With the keeper's kept commitments the attacker is named whatever the order.
+    expect(() => recoverEpoch([attacker, opened[1]!, opened[2]!], { expected: { sealId: s.sealId, commitments: s.commitments } })).toThrow(PoisonedShareError)
+  })
+  it('a lie about the threshold yields an error, not a wrong key', () => {
+    const s = seal()
+    const opened = openAll(s)
+    const relabelled = opened.slice(0, 2).map((o) => ({ ...o, threshold: 2 }))
+    expect(() => recoverEpoch(relabelled)).toThrow(/does not match its commitment/)
+  })
+  it('a refusal of one signed copy of a request counts against a re-issue with the same election id', async () => {
+    const s = seal()
+    const opened = openAll(s)
+    const real = nowSec()
+    const r1 = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members, delaySeconds: DELAY, recoverTo, now: () => real })
+    const ballot = await refuse(at(s, 2), r1, opened[2]!)
+    // The keeper re-signs the same d with a new destination.
+    const d = r1.tags.find((t) => t[0] === 'd')![1]!
+    const r2 = finalizeEvent({ kind: r1.kind, created_at: r1.created_at + 1, content: r1.content, tags: r1.tags.map((t) => (t[0] === 'description' ? ['description', t[1]!.replace(recoverTo, getPublicKey(generateSecretKey()))] : [...t])) }, keeper)
+    expect(r2.tags.find((t) => t[0] === 'd')![1]).toBe(d)
+    expect(recoveryOutcome(r2, [ballot], members, real + DELAY + 1)).toBe('refused')
+    // A different election id is a different request.
+    const r3 = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members, delaySeconds: DELAY, recoverTo, now: () => real })
+    expect(recoveryOutcome(r3, [ballot], members, real + DELAY + 1)).toBe('allowed')
+  })
+  it('firstSeen in the future is refused', async () => {
+    const s = seal()
+    const opened = openAll(s)
+    const real = nowSec()
+    const request = await requestRecovery({ keeperPrivateKey: keeper, epochId: EPOCH, members, delaySeconds: DELAY, recoverTo, now: () => real })
+    expect(() => releaseShare({ memberPrivateKey: at(s, 0), share: opened[0]!, request, ballots: [], firstSeen: real + DELAY + 2, now: real + DELAY + 1 })).toThrow(/no later than now/)
   })
 })

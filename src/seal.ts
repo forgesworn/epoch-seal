@@ -36,6 +36,11 @@ export function shareCommitment(index: number, data: Uint8Array): string {
   return bytesToHex(sha256(new Uint8Array([index & 0xff, ...data])))
 }
 
+/** Commitment to the epoch key itself, so a reconstruction from mislabelled shares is caught rather than trusted. */
+export function keyCommitment(key: Uint8Array): string {
+  return bytesToHex(sha256(new Uint8Array([...utf8ToBytes('epoch-seal/key/v1'), ...key])))
+}
+
 export interface SealOptions {
   /** The 32-byte key the closed epoch's store is encrypted under. */
   epochKey: Uint8Array
@@ -77,8 +82,9 @@ export interface Sealing {
  *
  * Each share is a dominion kind 30480 vault-share rumor (tier `sealed`,
  * content the 32-byte share) carrying the share index, the threshold, the
- * sealing id, the circle hash, the committed delay and a commitment to every
- * share of the sealing. It is sealed by the keeper and gift-wrapped to the
+ * sealing id, the circle hash and the circle itself, the committed delay,
+ * a commitment to the epoch key and a commitment to every share of the
+ * sealing. It is sealed by the keeper and gift-wrapped to the
  * member, so a relay sees only a wrap to a key. The keeper then destroys the
  * epoch key locally; that destruction is what makes compulsion yield the
  * current epoch and nothing older.
@@ -94,6 +100,7 @@ export function sealEpoch(opts: SealOptions): Sealing {
   if (members.includes(keeperPub)) throw new Error('the keeper is not a member of its own circle')
   const sealId = bytesToHex(randomBytes(16))
   const circle = circleHash(members)
+  const keyCommit = keyCommitment(opts.epochKey)
   const raw = splitCK(opts.epochKey, opts.threshold, members.length)
   const byIndex = [...raw].sort((a, b) => a.index - b.index)
   const commitments = byIndex.map((s) => shareCommitment(s.index, s.data))
@@ -105,7 +112,9 @@ export function sealEpoch(opts: SealOptions): Sealing {
       ['threshold', String(opts.threshold)],
       ['seal', sealId],
       ['circle', circle],
+      ['members', ...members],
       ['delay', String(opts.delaySeconds)],
+      ['keycommit', keyCommit],
       ...commitments.map((c, j) => ['commit', String(byIndex[j]!.index), c]),
     )
     if (opts.now) rumor.created_at = opts.now()
@@ -122,7 +131,11 @@ export interface OpenedShare {
   threshold: number
   sealId: string
   circle: string
+  /** The canonical circle itself, so every member can refuse and release without being told the list by the keeper. */
+  members: string[]
   delaySeconds: number
+  /** Commitment to the epoch key, checked after reconstruction. */
+  keyCommitment: string
   /** Commitment per index for the whole sealing, keyed by index. */
   commitments: Map<number, string>
   data: Uint8Array
@@ -168,6 +181,14 @@ export function openShare(wrap: NostrEvent, memberPrivateKey: Uint8Array): Opene
   if (!sealId || !/^[0-9a-f]{32}$/.test(sealId) || !circle || !HEX64.test(circle)) throw new Error('malformed sealed share')
   if (!Number.isInteger(delaySeconds) || delaySeconds < MIN_DELAY_SECONDS) throw new Error('malformed sealed share')
   if (parsed.epochId.includes(':') || tagValue(tags, 'd') !== `${parsed.epochId}:${SEALED_TIER}`) throw new Error('malformed sealed share')
+  const membersTag = tags.filter((t) => t[0] === 'members')
+  if (membersTag.length !== 1) throw new Error('malformed sealed share')
+  const members = membersTag[0]!.slice(1)
+  let canonical: string[]
+  try { canonical = canonicalCircle(members) } catch { throw new Error('malformed sealed share') }
+  if (canonical.length !== members.length || canonical.some((m, i) => m !== members[i]) || circleHash(canonical) !== circle) throw new Error('share names a circle that does not match its hash')
+  const keyCommit = tagValue(tags, 'keycommit')
+  if (!keyCommit || !HEX64.test(keyCommit)) throw new Error('malformed sealed share')
   const commitments = new Map<number, string>()
   for (const t of tags) {
     if (t[0] !== 'commit') continue
@@ -180,7 +201,7 @@ export function openShare(wrap: NostrEvent, memberPrivateKey: Uint8Array): Opene
   if (to !== getPublicKey(memberPrivateKey)) throw new Error('this share was not sealed to this member')
   const data = hexToBytes(parsed.ckHex)
   if (shareCommitment(index, data) !== commitments.get(index)) throw new Error('share does not match its commitment')
-  return { keeper: sealer, epochId: parsed.epochId, index, threshold, sealId, circle, delaySeconds, commitments, data }
+  return { keeper: sealer, epochId: parsed.epochId, index, threshold, sealId, circle, members: canonical, delaySeconds, keyCommitment: keyCommit, commitments, data }
 }
 
 export interface RecoverOptions {
@@ -196,22 +217,60 @@ export class PoisonedShareError extends Error {
   }
 }
 
+/** Thrown when the shares do not agree on what the sealing was and no set has a threshold behind it, so nobody can be blamed. */
+export class ShareSetError extends Error {
+  constructor(public readonly indices: number[], message: string) {
+    super(message)
+    this.name = 'ShareSetError'
+  }
+}
+
+function setKey(m: Map<number, string>): string {
+  return [...m].sort((a, b) => a[0] - b[0]).map(([i, c]) => `${i}:${c}`).join(',')
+}
+
 /**
  * Reconstruct the epoch key from `threshold` distinct shares of one sealing.
- * Every share must carry the same sealing id and the same commitment set,
- * and hash to its own commitment; a share that does not is reported by
- * index, which the recovering keeper can map to the member who returned it.
+ * The commitment set every share is checked against is the one the keeper
+ * kept (`expected`), or else the set a strict majority of the returned
+ * shares agree on; a share that does not match it is refused by index,
+ * which the recovering keeper can map to the member who returned it. When
+ * no set has a majority nobody is blamed: `ShareSetError` names every
+ * index that disagrees with the first. The reconstruction is then
+ * checked against the key commitment, so mislabelled shares yield an error
+ * rather than a wrong key.
  */
 export function recoverEpoch(shares: OpenedShare[], opts: RecoverOptions = {}): Uint8Array {
   if (!Array.isArray(shares) || shares.length === 0) throw new Error('no shares')
   const first = shares[0]!
-  const { epochId, threshold, sealId } = first
-  const reference = opts.expected
-    ? new Map(opts.expected.commitments.map((c, i) => [i + 1, c]))
-    : first.commitments
+  const { epochId, threshold, sealId, keyCommitment: kc } = first
   if (opts.expected && opts.expected.sealId !== sealId) throw new Error('shares are not from the expected sealing')
   for (const s of shares) {
-    if (s.epochId !== epochId || s.threshold !== threshold || s.sealId !== sealId) throw new Error('shares are not from one sealing')
+    if (s.epochId !== epochId || s.threshold !== threshold || s.sealId !== sealId || s.keyCommitment !== kc || s.circle !== first.circle) throw new Error('shares are not from one sealing')
+  }
+  let reference: Map<number, string>
+  if (opts.expected) {
+    reference = new Map(opts.expected.commitments.map((c, i) => [i + 1, c]))
+  } else {
+    const groups = new Map<string, { set: Map<number, string>; indices: number[] }>()
+    for (const s of shares) {
+      const k = setKey(s.commitments)
+      const g = groups.get(k) ?? { set: s.commitments, indices: [] }
+      g.indices.push(s.index)
+      groups.set(k, g)
+    }
+    // The reference is the set a strict majority of the returned shares carry.
+    // One attacker among three is named; one against one is a tie, and a tie
+    // blames nobody.
+    const total = new Set(shares.map((s) => s.index)).size
+    const majority = [...groups.values()].filter((g) => new Set(g.indices).size * 2 > total)
+    if (majority.length !== 1) {
+      const firstKey = setKey(first.commitments)
+      throw new ShareSetError(shares.filter((s) => setKey(s.commitments) !== firstKey).map((s) => s.index), 'shares disagree about the sealing and no set has a majority behind it')
+    }
+    reference = majority[0]!.set
+  }
+  for (const s of shares) {
     if (s.commitments.size !== reference.size || [...reference].some(([i, c]) => s.commitments.get(i) !== c)) {
       throw new PoisonedShareError(s.index, `share ${s.index} carries a different commitment set`)
     }
@@ -220,5 +279,7 @@ export function recoverEpoch(shares: OpenedShare[], opts: RecoverOptions = {}): 
   const distinct = new Map(shares.map((s) => [s.index, s]))
   if (distinct.size < threshold) throw new Error(`need ${threshold} distinct shares, have ${distinct.size}`)
   const chosen = [...distinct.values()].slice(0, threshold)
-  return reconstructCK(chosen.map((s) => ({ index: s.index, data: s.data })))
+  const key = reconstructCK(chosen.map((s) => ({ index: s.index, data: s.data })))
+  if (keyCommitment(key) !== kc) throw new Error('reconstructed key does not match its commitment: the threshold or the shares were mislabelled')
+  return key
 }

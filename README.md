@@ -28,12 +28,13 @@ const mine = openShare(wrap, myRendezvousKey)
 // 3. Months later the keeper asks for the epoch back, over the same circle, with a lock at least as long as the sealed delay.
 const request = await requestRecovery({ keeperPrivateKey, epochId: '2026-W37', members, delaySeconds: 48 * 3600, recoverTo: myCurrentKey })
 
-// 3a. Any member who is uneasy refuses. The ballot is ring-signed over the circle: nobody learns who.
-const ballot = await refuse(myRendezvousKey, request, members)
+// 3a. Any member who is uneasy refuses. The ballot is ring-signed over the circle the share carries: nobody learns who.
+const ballot = await refuse(myRendezvousKey, request, mine)
+sendToEveryMember(ballot, mine.members)                   // as well as the relay: a relay the keeper picks can drop it
 
 // 4. After the lock, with no refusal, members release; three shares rebuild the key.
 const firstSeen = whenIFirstSawIt(request)                // the member's own clock, never the request's dates
-send(releaseShare({ memberPrivateKey, share: mine, request, ballots, members, firstSeen }))
+send(releaseShare({ memberPrivateKey, share: mine, request, ballots, firstSeen }))   // after a grace period past the delay
 const key = recoverEpoch(returnedShares.map((w) => openShare(w, myCurrentKey)), { expected: kept })
 ```
 
@@ -42,27 +43,28 @@ const key = recoverEpoch(returnedShares.map((w) => openShare(w, myCurrentKey)), 
 - **Compulsion yields one epoch.** The keeper cannot produce an older key alone, because it does not exist anywhere alone.
 - **Recovery is witnessed.** A request is an election every member sees. Silence until the lock passes is consent.
 - **Refusal is anonymous.** A ballot is ring-signed over the circle. The keeper, and whoever is standing over the keeper, cannot tell which friend said no.
-- **The circle and the delay are fixed at sealing.** Every share carries a hash of the circle and the shortest lock a recovery may have. A request over any other circle, or with a shorter lock, releases nothing, so a keeper under pressure cannot ask a circle of their own choosing or ask quickly.
-- **The delay is the member's.** Each member measures it from the moment they first saw the request, by their own clock. A request dated into the past does not shorten it.
-- **A poisoned share is named.** Every share carries a commitment to every share of its sealing. A returned share that does not match is refused by index, which the keeper can map to the member who returned it.
-- **A refusal is a refusal whenever it was cast.** A valid ring signature over the circle bound to the request counts, even if its timestamp is after close, so a late objection is never discarded by a clock.
-- **Nothing on the wire names anyone.** Shares travel as gift wraps; the request and ballots are the anonymous-vote kinds. The sealing id and commitments are inside the wrap, and reveal nothing about the key.
+- **The circle and the delay are fixed at sealing.** Every share carries the circle itself, its hash and the shortest lock a recovery may have. A request over any other circle, or with a shorter lock, releases nothing, so a keeper under pressure cannot ask a circle of their own choosing, ask quickly, or choose who is able to refuse by choosing who is told the list.
+- **The delay is the member's.** Each member measures it from the moment they first saw the request, by their own clock, and a request whose lock had already closed when they first saw it releases nothing. A request dated into the past neither shortens the wait nor removes the refusal: `refuse` casts at any time, whatever the request's dates say.
+- **A poisoned share is named.** Every share carries a commitment to every share of its sealing and to the key. A returned share that does not match the set the keeper kept, or the set a majority of returned shares carry, is refused by index, which the keeper can map to the member who returned it; a tie blames nobody. A reconstruction that does not match the key commitment is an error, never a wrong key.
+- **A refusal is a refusal whenever it was cast.** A valid ring signature over the circle bound to the request's election id counts, even if its timestamp is after close and even against a re-signed copy of the request. It can still come too late: once the first member has released, that share is gone, so the deadline that matters is the earliest member's delay, and clients should wait a grace period past their own.
+- **The ballot names nobody.** The share wraps name the members' rendezvous keys, as every gift wrap names its recipient, and the request names the keeper and the destination. Only the refusal is anonymous, and only at the event layer: a member's relay connection is their own business.
 
 ## What it does not do
 
 - **Decoys, duress phrases, silent alarms.** Those are CAIRN's coercion-resistant layer and stay behind its implementation gate. This is honest threshold recovery: a refusal is visible as a refusal, and a coerced keeper is a keeper who has to wait 48 hours in front of someone.
 - **Choose the threshold or the delay for you.** Both are the keeper's at sealing time, and the profile that uses this says what they should be. The floor is an hour.
 - **Stop the keeper's own circle from helping a coerced keeper.** If enough members release, the epoch comes back. The circle is the defence.
+- **Deliver the refusal.** Silence is consent, so a relay that drops ballots turns a refusal into consent, and the keeper often chooses the relay. A refusing member sends the ballot to every other member directly as well (the share carries the list), and every member waits a grace period past their delay before releasing.
 - **Talk to relays.** It builds and reads events.
 
 ## Security notes
 
 - `openShare` opens the gift wrap by hand and verifies the seal's signature and that the rumor's author is the sealer. `nostr-tools`' `unwrapEvent` verifies nothing and is not used.
 - `requestDetails` verifies the request's signature and refuses anything that is not exactly the shape `requestRecovery` makes: two options, one tally key equal to the author, a committed ring, a lock later than its open.
-- `releaseShare` throws unless the request is the sealing keeper's, for this epoch, over the sealed circle, with a lock no shorter than the sealed delay, that delay has passed since this member first saw it, the lock has closed with no refusal, and the seven-day release window is still open. A client must not catch that and release anyway.
-- A member judges the outcome with `isRefusal` alone; the tally key is never needed, because any valid ballot is a refusal.
+- `releaseShare` throws unless the request is the sealing keeper's, for this epoch, over the sealed circle, with a lock no shorter than the sealed delay, first seen before it closed and no later than now, that delay has passed since this member first saw it, the lock has closed with no refusal, and the seven-day release window is still open. A client must not catch that and release anyway.
+- A member judges the outcome with `isRefusal` alone; the tally key is never needed, because any valid ballot is a refusal, an `allow` ballot included.
+- `refuse` builds the ballot itself from `@forgesworn/ring-sig` and nostr-anon-vote's primitives rather than `castBallot`, which refuses to cast once the wall clock passes the request's close.
 - `recoverEpoch` needs `threshold` distinct shares from one sealing that all carry the same commitment set and each match their commitment. Shares from two sealings never mix.
-- `castBallot` checks the wall clock, so a refusal is normally cast while the request is open; a late one still counts on the reading side.
 - The keeper may not be a member of its own circle, and the epoch id may not contain a colon.
 
 ## Licence
