@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0 (2026-09-09)
+
+### Features
+
+- seal an epoch key to a circle and recover it by witnessed, refusable, time-locked request
+
+### Bug Fixes
+
+- second review pass on sealing and recovery
+- apply the independent review to sealing and recovery
+
+
+
 ## 0.1.0
 
 - Second review pass (2026-09-09): `refuse` casts at any time (built from

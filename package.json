@@ -1,6 +1,6 @@
 {
   "name": "epoch-seal",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Seal an epoch key to a circle: threshold shares gift-wrapped to friends, a time-locked recovery request any of them can refuse by anonymous ballot, and reconstruction only when nobody did.",
   "type": "module",
   "main": "./dist/index.js",
