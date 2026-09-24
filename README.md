@@ -17,6 +17,12 @@ It composes three things that already ship: Shamir shares and the kind
 30480 vault-share event from `dominion-protocol`, NIP-59 gift wraps from
 `nostr-tools`, and ring-signed ballots from `nostr-anon-vote`.
 
+## Install
+
+```bash
+npm install epoch-seal
+```
+
 ## The four moves
 
 ```ts
