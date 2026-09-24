@@ -1,0 +1,47 @@
+# epoch-seal
+
+> A key that only comes back through a witnessed, refusable, time-locked
+> request from friends solves compulsion better than a key that never
+> leaves one place. epoch-seal splits a closed epoch's key across a circle
+> so a compelled keeper can yield only the current epoch, never the past.
+
+It composes three things that already ship: Shamir shares and the kind
+30480 vault-share event from `dominion-protocol`, NIP-59 gift wraps from
+`nostr-tools`, and ring-signed ballots from `nostr-anon-vote`. Use it when
+a box needs to forget an epoch's key on rotation and get it back only
+through a delayed, anonymous-refusal election among a fixed circle.
+
+## Getting Started
+
+```bash
+npm install epoch-seal
+```
+
+```ts
+import { sealEpoch, openShare, requestRecovery, refuse, releaseShare, recoverEpoch } from 'epoch-seal'
+
+const sealing = sealEpoch({ epochKey, epochId: '2026-W37', keeperPrivateKey, members, threshold: 3, delaySeconds: 48 * 3600 })
+const mine = openShare(wrap, myRendezvousKey)
+const request = await requestRecovery({ keeperPrivateKey, epochId: '2026-W37', members, delaySeconds: 48 * 3600, recoverTo: myCurrentKey })
+```
+
+## Key Concepts
+
+- **Sealing**: the keeper splits a closed epoch's key into shares gift-wrapped one per circle member, then forgets the key.
+- **Circle**: the fixed set of members a sealing names; a recovery request over any other circle or a shorter lock releases nothing.
+- **Recovery request**: an election every member sees; silence until the lock passes counts as consent.
+- **Refusal**: a ring-signed ballot over the circle, so a refusal is visible but the refuser is not identifiable.
+- **Release**: after the delay has passed since a member first saw the request, with no refusal, that member's share is sent back; `threshold` shares reconstruct the key.
+
+## API Surface
+
+- `sealEpoch(opts)`, `openShare(wrap, key)`, `recoverEpoch(shares, opts?)` - seal, open and reconstruct.
+- `canonicalCircle(members)`, `circleHash(members)`, `shareCommitment(index, data)`, `keyCommitment(key)` - the commitments a share carries.
+- `requestRecovery(opts)`, `refuse(key, request, share, opts?)`, `requestDetails(request)`, `isRefusal(ballot, request, ring)`, `recoveryOutcome(request, ballots, members, now?)`, `releaseShare(opts)` - the recovery election.
+- `SEALED_TIER`, `MIN_DELAY_SECONDS`, `REFUSE`, `ALLOW`, `RELEASE_WINDOW_SECONDS` - constants used by the above.
+- `PoisonedShareError`, `ShareSetError` - thrown by `recoverEpoch` when a returned share does not match its commitment or the sealing's commitment set.
+
+## Optional
+
+- [README](README.md): full walkthrough, security notes, what this does not do.
+- [CHANGELOG](CHANGELOG.md): release history.
