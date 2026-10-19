@@ -42,7 +42,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/forgesworn/epoch-seal"
+    "url": "git+https://github.com/forgesworn/epoch-seal.git"
   },
   "homepage": "https://github.com/forgesworn/epoch-seal#readme",
   "bugs": {
