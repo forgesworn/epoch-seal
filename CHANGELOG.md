@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 (2026-10-19)
+
+### Bug Fixes
+
+- make examples runnable and state types, keys, time limits and errors (#1) (docs)
+
+
+
 ## 0.2.0 (2026-09-09)
 
 ### Features
