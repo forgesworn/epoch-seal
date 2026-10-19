@@ -23,7 +23,7 @@ It composes three things that already ship: Shamir shares and the kind
 npm install epoch-seal
 ```
 
-epoch-seal is ESM only: `package.json` sets `"type": "module"` and `exports` has only `types` and `import` conditions, no `require`, so use `import`. There is no CommonJS build; from CommonJS, load it with `await import('epoch-seal')`. It needs Node 22 or later. The examples take key helpers from `nostr-tools`, which epoch-seal depends on at exactly 2.23.9; install that same version yourself (`npm install nostr-tools@2.23.9`) so there is one copy.
+epoch-seal is ESM only: `package.json` sets `"type": "module"` and `exports` has only `types` and `import` conditions, no `require`, so use `import`. There is no CommonJS build; from CommonJS, load it with `await import('epoch-seal')`. It needs Node 22 or later. The examples take key helpers from `nostr-tools`, which epoch-seal depends on at exactly 2.23.9; install that same version yourself (`npm install nostr-tools@2.23.9`) so there is one copy. The exact pin is deliberate and shared across ForgeSworn packages; [AGENTS.md](./AGENTS.md) gives the reason and says not to bump it on its own.
 
 ## The four moves
 

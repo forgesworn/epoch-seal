@@ -15,7 +15,7 @@ through a delayed, anonymous-refusal election among a fixed circle.
 
 ```bash
 npm install epoch-seal
-npm install nostr-tools@2.23.9   # key helpers in the example; the exact version epoch-seal depends on
+npm install nostr-tools@2.23.9   # key helpers in the example; the exact version epoch-seal depends on, pinned on purpose (see AGENTS.md)
 ```
 
 epoch-seal is ESM only: `package.json` sets `"type": "module"` and `exports` has only `types` and `import` conditions, no `require`. Use `import`; there is no CommonJS build (from CommonJS, use `await import('epoch-seal')`). Node 22 or later.
@@ -133,4 +133,5 @@ Errors from `recoverEpoch`:
 ## Optional
 
 - [README](README.md): full walkthrough, security notes, what this does not do.
+- [AGENTS.md](AGENTS.md): build commands, source layout and why `nostr-tools` is pinned to exactly 2.23.9.
 - [CHANGELOG](CHANGELOG.md): release history.
