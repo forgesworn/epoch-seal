@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 (2026-10-19)
+
+### Bug Fixes
+
+- explain the nostr-tools pin, map exports to files, widen package metadata (#2) (docs)
+
+
+
 ## 0.2.1 (2026-10-19)
 
 ### Bug Fixes
