@@ -43,22 +43,21 @@ test/            - test suite
 root `overrides` entry. Do not bump it, turn it into a range or remove the
 override as a side effect of other work.
 
-- Why: ForgeSworn packages used together pin the same version, so one copy of
-  `nostr-tools` is installed. 2.23.9 was kept while upstream issue
-  https://github.com/nbd-wtf/nostr-tools/issues/539 was open: from 2.23.11, a
-  pool with `enablePing` closes its relay connection and live subscriptions
-  die after about 70 seconds.
+- Why: 2.23.9 is the version ForgeSworn packages that run a relay pool with
+  `enablePing` (roost-kit and the apps built on it) stayed on while upstream
+  issue https://github.com/nbd-wtf/nostr-tools/issues/539 was open: from
+  2.23.11, such a pool closes its relay connection and live subscriptions die
+  after about 70 seconds. epoch-seal took the same pin when it was created.
+  Other ForgeSworn packages already use 2.24.x or 2.25.x.
 - epoch-seal opens no pools itself (it imports only `nostr-tools/pure`,
   `nostr-tools/nip44` and `nostr-tools/nip59`), so that bug does not touch this
-  library directly. The pin is for consistency with the packages it runs
-  alongside.
+  library.
 - `overrides` only takes effect when this repository is the root of an install
   (development and tests). It does not bind consumers, which is why the README
   tells them to install the same version themselves.
 - Upstream status, checked on 2026-10-19: #539 was closed on 2026-07-29 and its
-  fix commit first ships in 2.24.2. The pin has not been lifted. Lifting it is
-  a decision for the owner, taken across all ForgeSworn packages together, not
-  a change to make in this repository alone.
+  fix commit first ships in 2.24.2. The pin has not been lifted; moving it is
+  the owner's call.
 
 ## Common Pitfalls
 
