@@ -15,14 +15,64 @@ through a delayed, anonymous-refusal election among a fixed circle.
 
 ```bash
 npm install epoch-seal
+npm install nostr-tools@2.23.9   # key helpers in the example; the exact version epoch-seal depends on
 ```
 
-```ts
-import { sealEpoch, openShare, requestRecovery, refuse, releaseShare, recoverEpoch } from 'epoch-seal'
+epoch-seal is ESM only: `package.json` sets `"type": "module"` and `exports` has only `types` and `import` conditions, no `require`. Use `import`; there is no CommonJS build (from CommonJS, use `await import('epoch-seal')`). Node 22 or later.
 
-const sealing = sealEpoch({ epochKey, epochId: '2026-W37', keeperPrivateKey, members, threshold: 3, delaySeconds: 48 * 3600 })
-const mine = openShare(wrap, myRendezvousKey)
-const request = await requestRecovery({ keeperPrivateKey, epochId: '2026-W37', members, delaySeconds: 48 * 3600, recoverTo: myCurrentKey })
+One script, run as an ES module (top-level `await`). It plays every role; in real use each role is its own process and the mailbox is your relays and storage. The library never sends an event.
+
+```ts
+import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+import type { NostrEvent } from 'nostr-tools/pure'
+import { sealEpoch, openShare, requestRecovery, requestDetails, refuse, recoveryOutcome, releaseShare, recoverEpoch } from 'epoch-seal'
+
+const unixNow = () => Math.floor(Date.now() / 1000)   // every time is Unix seconds
+const EPOCH_ID = '2026-W37'
+const DELAY_SECONDS = 48 * 3600
+
+const mailbox = new Map<string, NostrEvent[]>()       // stand-in for relays and storage
+const send = (event: NostrEvent, toPubkey: string) => { mailbox.set(toPubkey, [...(mailbox.get(toPubkey) ?? []), event]) }
+const received = (pubkey: string) => mailbox.get(pubkey) ?? []
+
+// Secret keys are 32-byte Uint8Arrays; public keys are lower-case 64-character hex strings.
+const keeperPrivateKey = generateSecretKey()
+const memberKeys = Array.from({ length: 5 }, () => generateSecretKey())   // members' rendezvous secret keys
+const members = memberKeys.map((k) => getPublicKey(k))                    // the circle: their rendezvous public keys
+const epochKey = crypto.getRandomValues(new Uint8Array(32))               // exactly 32 bytes
+
+// 1. Keeper seals: 3 of 5, 48-hour delay. sealEpoch does not wipe epochKey; the caller does.
+const sealing = sealEpoch({ epochKey, epochId: EPOCH_ID, keeperPrivateKey, members, threshold: 3, delaySeconds: DELAY_SECONDS })
+for (const s of sealing.shares) send(s.wrap, s.member)
+const kept = { sealId: sealing.sealId, commitments: sealing.commitments }   // not secret; this is the `expected` shape
+epochKey.fill(0)
+
+// 2. Each member opens their wrap with their rendezvous secret key.
+const shares = memberKeys.map((key) => openShare(received(getPublicKey(key))[0]!, key))
+
+// 3. Keeper requests recovery. recoverTo is PUBLISHED: pass the public key, never a secret key.
+const recoverySecretKey = generateSecretKey()                             // stays local; opens the returned wraps
+const request = await requestRecovery({ keeperPrivateKey, epochId: EPOCH_ID, members, delaySeconds: DELAY_SECONDS, recoverTo: getPublicKey(recoverySecretKey) })
+const firstSeen = unixNow()                                               // each member's own record of when the request reached them
+
+// 3a. A member who is uneasy refuses; the ballot is ring-signed over the circle the share carries.
+const ballots: NostrEvent[] = []                                          // every ballot received, from relays and directly
+const someoneIsUneasy = false                                             // true: step 4 throws "recovery is refused"
+if (someoneIsUneasy) {
+  const ballot = await refuse(memberKeys[0]!, request, shares[0]!)
+  for (const m of shares[0]!.members) send(ballot, m)
+  ballots.push(ballot)
+}
+
+// 4. After the lock, with no refusal, members release; three shares rebuild the key.
+const graceSeconds = 3600                                                 // client policy; the library defines no grace period
+const releaseAt = firstSeen + DELAY_SECONDS + graceSeconds                // simulated clock; in real use omit `now`
+console.log(recoveryOutcome(request, ballots, members, releaseAt))        // 'allowed'
+const { recoverTo } = requestDetails(request)
+for (const i of [0, 1, 2]) {
+  send(releaseShare({ memberPrivateKey: memberKeys[i]!, share: shares[i]!, request, ballots, firstSeen, now: releaseAt }), recoverTo)
+}
+const key = recoverEpoch(received(recoverTo).map((wrap) => openShare(wrap, recoverySecretKey)), { expected: kept })   // Uint8Array(32)
 ```
 
 ## Key Concepts
@@ -33,13 +83,52 @@ const request = await requestRecovery({ keeperPrivateKey, epochId: '2026-W37', m
 - **Refusal**: a ring-signed ballot over the circle, so a refusal is visible but the refuser is not identifiable.
 - **Release**: after the delay has passed since a member first saw the request, with no refusal, that member's share is sent back; `threshold` shares reconstruct the key.
 
+## Values and types
+
+- Secret keys (`epochKey`, `keeperPrivateKey`, `memberPrivateKey`): `Uint8Array`, 32 bytes, never hex.
+- Public keys (`members`, `recoverTo`): lower-case 64-character hex strings (x-only). Upper case and `npub` are rejected. `members` is de-duplicated and sorted for you, needs two or more distinct entries, and `sealEpoch` rejects a circle that contains the keeper.
+- `threshold`: integer, 2 to the number of members. `epochId`: non-empty string, no colon. `delaySeconds`: integer, at least `MIN_DELAY_SECONDS`.
+- Times (`firstSeen`, `now`, `opens`, `closes`): Unix seconds as numbers, never milliseconds or `Date`. Option `now` is `() => number` for `sealEpoch`, `requestRecovery` and `refuse`; it is a plain `number` for `releaseShare` and `recoveryOutcome`.
+- Events (`wrap`, `request`, `ballot`) are `NostrEvent` from `nostr-tools/pure`.
+- Rendezvous key: the key pair a party receives gift wraps at. `members` are the members' rendezvous public keys; a member's rendezvous secret key is `memberPrivateKey`. `recoverTo` is the keeper's current rendezvous public key, published in the request; its secret half only ever goes to `openShare` locally. A 64-character hex secret key passes the `recoverTo` format check and would be published.
+
 ## API Surface
 
-- `sealEpoch(opts)`, `openShare(wrap, key)`, `recoverEpoch(shares, opts?)` - seal, open and reconstruct.
-- `canonicalCircle(members)`, `circleHash(members)`, `shareCommitment(index, data)`, `keyCommitment(key)` - the commitments a share carries.
-- `requestRecovery(opts)`, `refuse(key, request, share, opts?)`, `requestDetails(request)`, `isRefusal(ballot, request, ring)`, `recoveryOutcome(request, ballots, members, now?)`, `releaseShare(opts)` - the recovery election.
-- `SEALED_TIER`, `MIN_DELAY_SECONDS`, `REFUSE`, `ALLOW`, `RELEASE_WINDOW_SECONDS` - constants used by the above.
-- `PoisonedShareError`, `ShareSetError` - thrown by `recoverEpoch` when a returned share does not match its commitment or the sealing's commitment set.
+All functions are synchronous except `requestRecovery` and `refuse`, which return a `Promise`. Exported types: `SealOptions`, `SealedShare`, `Sealing`, `OpenedShare`, `RecoverOptions`, `RecoveryRequestOptions`, `RefuseOptions`, `RequestDetails`, `ReleaseOptions`, `Outcome`.
+
+Seal, open and reconstruct:
+
+- `sealEpoch(opts: SealOptions): Sealing`. `SealOptions` is `{ epochKey: Uint8Array; epochId: string; keeperPrivateKey: Uint8Array; members: string[]; threshold: number; delaySeconds: number; now?: () => number }`; `now` only sets the inner timestamp of each share. Returns `Sealing`: `{ sealId: string; circle: string; delaySeconds: number; commitments: string[]; shares: SealedShare[] }`, where `SealedShare` is `{ member: string; index: number; wrap: NostrEvent }` (one gift wrap per member, `index` is 1-based). Throws on invalid options, and if the keeper is in the circle. It does not modify or wipe `epochKey`: the caller must (`epochKey.fill(0)`), and must remove any other copy.
+- `openShare(wrap: NostrEvent, memberPrivateKey: Uint8Array): OpenedShare`. Verifies the seal signature and that the author is the sealer; throws otherwise, and if the wrap is not for this key or the share fails its commitment. `OpenedShare` is `{ keeper: string; epochId: string; index: number; threshold: number; sealId: string; circle: string; members: string[]; delaySeconds: number; keyCommitment: string; commitments: Map<number, string>; data: Uint8Array }`. `keeper` is the rumor's author: the keeper on a fresh share, the releasing member on a returned one. `members` is the canonical circle.
+- `recoverEpoch(shares: OpenedShare[], opts?: RecoverOptions): Uint8Array`. `RecoverOptions` is `{ expected?: { sealId: string; commitments: string[] } }`: pass `{ sealId: sealing.sealId, commitments: sealing.commitments }` as kept at sealing, where `commitments[i]` is for share index `i + 1`. Returns the 32-byte key.
+
+The commitments a share carries:
+
+- `canonicalCircle(members: readonly string[]): string[]`. De-duplicated, sorted, lower-case hex; throws on anything else.
+- `circleHash(members: readonly string[]): string`. 64-character hex sha256 of the canonical circle.
+- `shareCommitment(index: number, data: Uint8Array): string`. 64-character hex.
+- `keyCommitment(key: Uint8Array): string`. 64-character hex.
+
+The recovery election:
+
+- `requestRecovery(opts: RecoveryRequestOptions): Promise<NostrEvent>`. `RecoveryRequestOptions` is `{ keeperPrivateKey: Uint8Array; epochId: string; members: string[]; delaySeconds: number; recoverTo: string; now?: () => number }`. Returns the signed request event. It opens one second before `now` and closes at `now + delaySeconds`.
+- `refuse(memberPrivateKey: Uint8Array, request: NostrEvent, share: OpenedShare, opts?: RefuseOptions): Promise<NostrEvent>`. `RefuseOptions` is `{ now?: () => number }`. Returns the ring-signed ballot. Throws if the request is not for the share's keeper, epoch and circle, or the key is not in the circle. Works at any time, whatever the request's dates say.
+- `requestDetails(request: NostrEvent): RequestDetails`. `RequestDetails` is `{ epochId: string; recoverTo: string; keeper: string; electionId: string; opens: number; closes: number; circle: string }`. Throws unless the event is a validly signed request of exactly the shape `requestRecovery` makes.
+- `isRefusal(ballot: NostrEvent, request: NostrEvent, ring: string[]): boolean`. `ring` is the circle's member pubkeys in canonical (sorted, de-duplicated) order, as in `share.members` or `canonicalCircle(members)`; the election commits to the ordered ring, so any other order returns `false`. Returns `false` for any ballot that fails verification; true for any validly ring-signed ballot of this request, whenever cast.
+- `recoveryOutcome(request: NostrEvent, ballots: NostrEvent[], members: string[], now?: number): Outcome`. `Outcome` is `'pending' | 'refused' | 'allowed' | 'expired'`. `members` may be in any order. `now` defaults to the current time in seconds. Any refusal gives `'refused'`; otherwise `'pending'` before the close, `'allowed'` from the close to `RELEASE_WINDOW_SECONDS` after it, then `'expired'`. Throws if `members` is not the circle the request names.
+- `releaseShare(opts: ReleaseOptions): NostrEvent`. `ReleaseOptions` is `{ memberPrivateKey: Uint8Array; share: OpenedShare; request: NostrEvent; ballots: NostrEvent[]; firstSeen: number; now?: number }`. Returns a gift wrap to the request's `recoverTo` carrying the share. Throws unless every release condition holds (see README "Security notes"); never catch and release anyway. The grace period is the caller's to wait: the library sets no value.
+
+Constants:
+
+- `SEALED_TIER` = `'sealed'`, `REFUSE` = `'refuse'`, `ALLOW` = `'allow'` (strings).
+- `MIN_DELAY_SECONDS` = 3600 (one hour, the shortest sealed delay or request lock).
+- `RELEASE_WINDOW_SECONDS` = 604800 (seven days, counted from the request's close).
+
+Errors from `recoverEpoch`:
+
+- `PoisonedShareError`: `index: number` is the offending share's index. Thrown when a share's commitment set differs from the reference set, or its data does not match its commitment. The reference set is `expected.commitments` if given, otherwise the set a strict majority of the returned shares carry. Only the first offending share, in the order given, is reported.
+- `ShareSetError`: `indices: number[]` lists every share whose commitment set differs from the first share's. Thrown only when `expected` is not given and no commitment set has a strict majority (a tie): nobody can be blamed, so these are disagreements, not culprits.
+- Plain `Error`: no shares; shares from different sealings; `expected.sealId` not matching; fewer than `threshold` distinct shares; a reconstruction that fails the key commitment.
 
 ## Optional
 
