@@ -17,9 +17,16 @@ builds and reads Nostr events; it does not talk to relays itself.
 ## Structure
 
 ```
-src/index.ts     - public exports
-src/seal.ts      - sealEpoch, openShare, recoverEpoch, commitments
-src/recovery.ts  - requestRecovery, refuse, releaseShare, recoveryOutcome
+src/index.ts     - public exports (re-exports from seal.ts and recovery.ts)
+src/seal.ts      - sealEpoch, openShare, recoverEpoch; the commitments
+                   (canonicalCircle, circleHash, shareCommitment, keyCommitment);
+                   SEALED_TIER, MIN_DELAY_SECONDS; the errors PoisonedShareError
+                   and ShareSetError; SealOptions, SealedShare, Sealing,
+                   OpenedShare, RecoverOptions
+src/recovery.ts  - requestRecovery, refuse, requestDetails, isRefusal,
+                   recoveryOutcome, releaseShare; REFUSE, ALLOW,
+                   RELEASE_WINDOW_SECONDS; RecoveryRequestOptions, RefuseOptions,
+                   RequestDetails, ReleaseOptions, Outcome
 test/            - test suite
 ```
 
@@ -29,6 +36,29 @@ test/            - test suite
 - No third-party relay I/O: the library only builds and reads Nostr events.
 - Node >=22.
 - ESM only: `"type": "module"`, and `exports` offers only `types` and `import`. Use `import`; there is no CommonJS build (from CommonJS, `await import('epoch-seal')`).
+
+## The nostr-tools pin
+
+`nostr-tools` is pinned to exactly `2.23.9` in `dependencies`, with a matching
+root `overrides` entry. Do not bump it, turn it into a range or remove the
+override as a side effect of other work.
+
+- Why: ForgeSworn packages used together pin the same version, so one copy of
+  `nostr-tools` is installed. 2.23.9 was kept while upstream issue
+  https://github.com/nbd-wtf/nostr-tools/issues/539 was open: from 2.23.11, a
+  pool with `enablePing` closes its relay connection and live subscriptions
+  die after about 70 seconds.
+- epoch-seal opens no pools itself (it imports only `nostr-tools/pure`,
+  `nostr-tools/nip44` and `nostr-tools/nip59`), so that bug does not touch this
+  library directly. The pin is for consistency with the packages it runs
+  alongside.
+- `overrides` only takes effect when this repository is the root of an install
+  (development and tests). It does not bind consumers, which is why the README
+  tells them to install the same version themselves.
+- Upstream status, checked on 2026-10-19: #539 was closed on 2026-07-29 and its
+  fix commit first ships in 2.24.2. The pin has not been lifted. Lifting it is
+  a decision for the owner, taken across all ForgeSworn packages together, not
+  a change to make in this repository alone.
 
 ## Common Pitfalls
 
