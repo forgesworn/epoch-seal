@@ -11,6 +11,12 @@ It composes three things that already ship: Shamir shares and the kind
 a box needs to forget an epoch's key on rotation and get it back only
 through a delayed, anonymous-refusal election among a fixed circle.
 
+## ForgeSworn ecosystem
+
+- [ForgeSworn library guide](https://forgesworn.dev/llms.txt): Find related libraries, tools and integration guides by task and runtime.
+- [ForgeSworn on GitHub](https://github.com/forgesworn): Browse the organisation’s public repositories.
+- [Project source](https://github.com/forgesworn/epoch-seal): Canonical source repository, documentation and release information.
+
 ## Getting Started
 
 ```bash
